@@ -21,8 +21,10 @@
 
 #include "log.h"
 #include "nextpnr.h"
+#include "timing.h"
 
 #include <algorithm>
+#include <cctype>
 #include <iterator>
 
 NEXTPNR_NAMESPACE_BEGIN
@@ -231,6 +233,8 @@ struct SDCParser
             return cmd_create_clock(arguments);
         else if (cmd == "set_false_path")
             return cmd_set_false_path(arguments);
+        else if (cmd == "set_multicycle_path")
+            return cmd_set_multicycle_path(arguments);
         else
             log_error("Unsupported SDC command '%s'\n", cmd.c_str());
     }
@@ -254,6 +258,50 @@ struct SDCParser
         return args;
     }
 
+    // The words of a Tcl list, e.g. a braced argument {a b c}
+    static std::vector<std::string> list_words(const std::string &list)
+    {
+        std::vector<std::string> words;
+        std::string word;
+        for (char c : list) {
+            if (std::isspace(static_cast<unsigned char>(c))) {
+                if (!word.empty())
+                    words.push_back(word);
+                word.clear();
+            } else {
+                word += c;
+            }
+        }
+        if (!word.empty())
+            words.push_back(word);
+        return words;
+    }
+
+    static bool is_glob(const std::string &pattern) { return pattern.find_first_of("*?") != std::string::npos; }
+
+    // '*' matches any run of characters, '?' any one character
+    static bool glob_match(const std::string &name, const std::string &pattern)
+    {
+        size_t n = 0, p = 0, star = std::string::npos, mark = 0;
+        while (n < name.size()) {
+            if (p < pattern.size() && (pattern[p] == name[n] || pattern[p] == '?')) {
+                n++;
+                p++;
+            } else if (p < pattern.size() && pattern[p] == '*') {
+                star = p++;
+                mark = n;
+            } else if (star != std::string::npos) {
+                p = star + 1;
+                n = ++mark;
+            } else {
+                return false;
+            }
+        }
+        while (p < pattern.size() && pattern[p] == '*')
+            p++;
+        return p == pattern.size();
+    }
+
     SdcValue cmd_get_nets(const std::vector<SdcValue> &arguments)
     {
         std::vector<SdcEntity> nets;
@@ -261,14 +309,24 @@ struct SDCParser
             auto &arg = arguments.at(i);
             if (!arg.is_string)
                 log_error("get_nets expected string arguments (line %d)\n", lineno);
-            std::string s = arg.str;
-            if (s.at(0) == '-')
-                log_error("unsupported argument '%s' to get_nets (line %d)\n", s.c_str(), lineno);
-            IdString id = ctx->id(s);
-            if (ctx->nets.count(id) || ctx->net_aliases.count(id))
-                nets.emplace_back(SdcEntity::ENTITY_NET, ctx->net_aliases.count(id) ? ctx->net_aliases.at(id) : id);
-            else
-                log_warning("get_nets argument '%s' matched no objects.\n", s.c_str());
+            for (const std::string &s : list_words(arg.str)) {
+                if (s.at(0) == '-')
+                    log_error("unsupported argument '%s' to get_nets (line %d)\n", s.c_str(), lineno);
+                if (is_glob(s)) {
+                    size_t found = nets.size();
+                    for (auto &net : ctx->nets)
+                        if (glob_match(net.first.str(ctx), s))
+                            nets.emplace_back(SdcEntity::ENTITY_NET, net.first);
+                    if (nets.size() == found)
+                        log_warning("get_nets argument '%s' matched no objects.\n", s.c_str());
+                    continue;
+                }
+                IdString id = ctx->id(s);
+                if (ctx->nets.count(id) || ctx->net_aliases.count(id))
+                    nets.emplace_back(SdcEntity::ENTITY_NET, ctx->net_aliases.count(id) ? ctx->net_aliases.at(id) : id);
+                else
+                    log_warning("get_nets argument '%s' matched no objects.\n", s.c_str());
+            }
         }
         return nets;
     }
@@ -297,12 +355,19 @@ struct SDCParser
             auto &arg = arguments.at(i);
             if (!arg.is_string)
                 log_error("get_cells expected string arguments (line %d)\n", lineno);
-            std::string s = arg.str;
-            if (s.at(0) == '-')
-                log_error("unsupported argument '%s' to get_cells (line %d)\n", s.c_str(), lineno);
-            IdString id = ctx->id(s);
-            if (ctx->cells.count(id))
-                cells.emplace_back(SdcEntity::ENTITY_CELL, id);
+            for (const std::string &s : list_words(arg.str)) {
+                if (s.at(0) == '-')
+                    log_error("unsupported argument '%s' to get_cells (line %d)\n", s.c_str(), lineno);
+                if (is_glob(s)) {
+                    for (auto &cell : ctx->cells)
+                        if (glob_match(cell.first.str(ctx), s))
+                            cells.emplace_back(SdcEntity::ENTITY_CELL, cell.first);
+                    continue;
+                }
+                IdString id = ctx->id(s);
+                if (ctx->cells.count(id))
+                    cells.emplace_back(SdcEntity::ENTITY_CELL, id);
+            }
         }
         return cells;
     }
@@ -427,6 +492,77 @@ struct SDCParser
                     to->name.c_str(ctx));
 
         return std::string{};
+    }
+
+    // set_multicycle_path <N> [-setup] [-from <list>] [-to <list>], lists of cells, cell pins or nets
+    // Paths from the -from cells (any, without -from) to the -to cells (any, without -to) may take N periods of their
+    // clock. A net stands for the cell that drives it, e.g. a register by its output. Hold stays checked on the launch
+    // edge, as after -hold N-1 in other tools.
+    SdcValue cmd_set_multicycle_path(const std::vector<SdcValue> &arguments)
+    {
+        int cycles = 0;
+        bool hold = false;
+        const SdcValue *from = nullptr, *to = nullptr;
+
+        for (int i = 1; i < int(arguments.size()); i++) {
+            auto &arg = arguments.at(i);
+            if (!arg.is_string)
+                log_error("unexpected list argument to set_multicycle_path (line %d)\n", lineno);
+            const std::string &s = arg.str;
+            if (s == "-setup") {
+                continue;
+            } else if (s == "-hold") {
+                hold = true;
+            } else if (s == "-from" || s == "-to") {
+                i++;
+                if (i >= int(arguments.size()) || arguments.at(i).is_string)
+                    log_error("expecting a list of cells, cell pins or nets after %s (line %d)\n", s.c_str(), lineno);
+                (s == "-from" ? from : to) = &arguments.at(i);
+            } else if (s.at(0) == '-') {
+                log_error("unsupported argument '%s' to set_multicycle_path (line %d)\n", s.c_str(), lineno);
+            } else {
+                try {
+                    cycles = std::stoi(s);
+                } catch (std::exception &e) {
+                    log_error("invalid path multiplier '%s' to set_multicycle_path (line %d)\n", s.c_str(), lineno);
+                }
+            }
+        }
+
+        if (hold) {
+            log_info("set_multicycle_path -hold: hold is always checked on the launch edge (line %d)\n", lineno);
+            return std::string{};
+        }
+        if (cycles < 1)
+            log_error("set_multicycle_path needs a path multiplier of 1 or more (line %d)\n", lineno);
+        if (from == nullptr && to == nullptr)
+            log_error("set_multicycle_path needs -from or -to (line %d)\n", lineno);
+
+        std::vector<CellInfo *> from_cells, to_cells;
+        if (from != nullptr)
+            from_cells = multicycle_cells(*from);
+        if (to != nullptr)
+            to_cells = multicycle_cells(*to);
+        set_multicycle_path(ctx, cycles, from ? &from_cells : nullptr, to ? &to_cells : nullptr, lineno);
+        return std::string{};
+    }
+
+    // The cells of a -from or -to list
+    std::vector<CellInfo *> multicycle_cells(const SdcValue &list)
+    {
+        std::vector<CellInfo *> cells;
+        for (const auto &ety : list.list) {
+            CellInfo *cell = nullptr;
+            if (ety.type == SdcEntity::ENTITY_CELL || ety.type == SdcEntity::ENTITY_PIN)
+                cell = ctx->cells.at(ety.name).get();
+            else if (ety.type == SdcEntity::ENTITY_NET)
+                cell = ctx->nets.at(ety.name)->driver.cell;
+            else
+                log_error("set_multicycle_path applies only to cells, cell pins or nets (line %d)\n", lineno);
+            if (cell != nullptr)
+                cells.push_back(cell);
+        }
+        return cells;
     }
 
     void operator()()
