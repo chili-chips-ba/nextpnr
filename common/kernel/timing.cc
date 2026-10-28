@@ -22,6 +22,7 @@
 #include "timing.h"
 #include <algorithm>
 #include <boost/range/adaptor/reversed.hpp>
+#include <cerrno>
 #include <deque>
 #include <limits>
 #include <map>
@@ -249,7 +250,8 @@ void TimingAnalyser::setup_port_domains()
                         domain_id_t dom;
                         // registered outputs are startpoints
                         if (fanin.type == CellArc::CLK_TO_Q)
-                            dom = domain_id(port.cell, fanin.other_port, fanin.edge);
+                            dom = domain_id(port.cell, fanin.other_port, fanin.edge,
+                                            multicycle_group(port.cell, false));
                         else if (fanin.type == CellArc::STARTPOINT)
                             dom = async_clock_id;
                         else
@@ -289,7 +291,8 @@ void TimingAnalyser::setup_port_domains()
                         domain_id_t dom;
                         // registered inputs are endpoints
                         if (fanout.type == CellArc::SETUP)
-                            dom = domain_id(port.cell, fanout.other_port, fanout.edge);
+                            dom = domain_id(port.cell, fanout.other_port, fanout.edge,
+                                            multicycle_group(port.cell, true));
                         else if (fanout.type == CellArc::ENDPOINT)
                             dom = async_clock_id;
                         else
@@ -319,16 +322,22 @@ void TimingAnalyser::setup_port_domains()
     for (auto &dp : domain_pairs) {
         auto &launch_data = domains.at(dp.key.launch);
         auto &capture_data = domains.at(dp.key.capture);
+        dp.same_clock = launch_data.key.same_clock(capture_data.key);
         if (launch_data.key.clock != capture_data.key.clock)
             continue;
         IdString clk = launch_data.key.clock;
         delay_t period = ctx->getDelayFromNS(1.0e9 / ctx->setting<float>("target_freq"));
+        int multicycle = 1;
         if (ctx->nets.count(clk)) {
             NetInfo *clk_net = ctx->nets.at(clk).get();
             if (clk_net->clkconstr) {
                 period = clk_net->clkconstr->period.minDelay();
+                // like the NEXTPNR_MCP_SETUP hook in walk_backward(), only on a constrained clock
+                multicycle = multicycle_periods(dp.key, period);
             }
         }
+        dp.multicycle = multicycle;
+        dp.multicycle_slack = period * (multicycle - 1);
         if (launch_data.key.edge != capture_data.key.edge)
             period /= 2;
         dp.period = DelayPair(period);
@@ -613,28 +622,46 @@ void TimingAnalyser::walk_forward()
     }
 }
 
+// An integer cell attribute: an integer, or a decimal string (as an XDC or SDC file sets it)
+static int64_t int_attr(const Context *ctx, const CellInfo *cell, IdString name)
+{
+    const Property &value = cell->attrs.at(name);
+    if (!value.is_string)
+        return value.as_int64();
+    const std::string &text = value.as_string();
+    char *end = nullptr;
+    errno = 0;
+    int64_t result = std::strtoll(text.c_str(), &end, 10);
+    bool is_integer = !text.empty() && *end == '\0' && errno == 0;
+    if (!is_integer)
+        log_error("cell '%s': %s = \"%s\" is not an integer\n", cell->name.c_str(ctx), name.c_str(ctx), text.c_str());
+    return result;
+}
+
+// At least 1, and at most what keeps (N-1) periods well inside delay_t; a larger N leaves no setup check anyway.
+static int cap_multicycle(int64_t cycles, delay_t period)
+{
+    cycles = std::max<int64_t>(1, cycles);
+    delay_t limit = std::numeric_limits<delay_t>::max() / 4;
+    if (period > 0 && cycles - 1 > limit / period)
+        cycles = 1 + int64_t(limit / period);
+    return int(cycles);
+}
+
 // set_multicycle_path -setup N on the endpoint's cell (NEXTPNR_MCP_SETUP, set by
-// the xilinx XDC parser): the capture edge moves N-1 periods later. 1 if not
-// tagged or the capture clock has no period constraint.
+// set_multicycle_path() for a -to list without -from): the capture edge moves N-1
+// periods later. 1 if not tagged or the capture clock has no period constraint.
 static int setup_multicycle(const Context *ctx, IdString cell, IdString clock)
 {
     if (cell == IdString() || clock == IdString() || !ctx->cells.count(cell) || !ctx->nets.count(clock))
         return 1;
     if (!ctx->nets.at(clock)->clkconstr)
         return 1;
-    const auto &attrs = ctx->cells.at(cell)->attrs;
-    auto mcp = attrs.find(ctx->id("NEXTPNR_MCP_SETUP"));
-    if (mcp == attrs.end())
+    const CellInfo *ci = ctx->cells.at(cell).get();
+    IdString attr = ctx->id("NEXTPNR_MCP_SETUP");
+    if (!ci->attrs.count(attr))
         return 1;
-    const Property &n = mcp->second;
-    int64_t cycles = n.is_string ? std::strtoll(n.as_string().c_str(), nullptr, 10) : n.as_int64();
-    cycles = std::max<int64_t>(1, cycles);
-    // Keep (N-1) periods well inside delay_t; a larger N leaves no setup check anyway.
-    delay_t period = ctx->nets.at(clock)->clkconstr->period.minDelay();
-    delay_t limit = std::numeric_limits<delay_t>::max() / 4;
-    if (period > 0 && cycles - 1 > limit / period)
-        cycles = 1 + int64_t(limit / period);
-    return int(cycles);
+    return cap_multicycle(int_attr(ctx, ci, attr), ctx->nets.at(clock)->clkconstr->period.minDelay());
 }
 
 void TimingAnalyser::walk_backward()
@@ -750,13 +777,16 @@ dict<domain_id_t, delay_t> TimingAnalyser::max_delay_by_domain_pairs()
                     }
                 }
 
-                // N-cycle endpoint: take out the N-1 periods added in walk_backward(), then
+                // N-cycle path: take out the N-1 periods walk_backward() added for an N-cycle
+                // endpoint (a set_multicycle_path -from pair adds its own to the slack only), then
                 // scale to the one-cycle budget the Fmax is computed from (a period, or half a
                 // period between opposite edges): the budget is 2*(N-1)+h half periods, not h.
-                if (mcp > 1) {
-                    delay_t period = ctx->nets.at(capture.key.clock)->clkconstr->period.minDelay();
-                    int h = domains.at(launch_id).key.edge == capture.key.edge ? 2 : 1;
-                    delay = (delay + period * (mcp - 1)) * h / (h + 2 * (mcp - 1));
+                int extra = (mcp - 1) + (domain_pairs.at(dp).multicycle - 1);
+                if (extra > 0) {
+                    if (mcp > 1)
+                        delay += ctx->nets.at(capture.key.clock)->clkconstr->period.minDelay() * (mcp - 1);
+                    int h = launch.key.edge == capture.key.edge ? 2 : 1;
+                    delay = delay * h / (h + 2 * extra);
                 }
 
                 if (!domain_delay.count(dp) || domain_delay.at(dp) < delay) {
@@ -793,11 +823,12 @@ void TimingAnalyser::compute_slack()
 
             auto &arr = pd.arrival.at(dp.key.launch);
             auto &req = pd.required.at(dp.key.capture);
-            pdp.second.setup_slack = 0 - (arr.value.maxDelay() - req.value.minDelay() + clock_to_clock);
+            pdp.second.setup_slack =
+                    dp.multicycle_slack - (arr.value.maxDelay() - req.value.minDelay() + clock_to_clock);
             if (!setup_only)
                 pdp.second.hold_slack = arr.value.minDelay() - req.value.maxDelay() + clock_to_clock;
             pdp.second.max_path_length = arr.path_length + req.path_length;
-            if (dp.key.launch == dp.key.capture)
+            if (dp.same_clock)
                 pd.worst_setup_slack = std::min(pd.worst_setup_slack, dp.period.minDelay() + pdp.second.setup_slack);
             dp.worst_setup_slack = std::min(dp.worst_setup_slack, pdp.second.setup_slack);
             if (!setup_only) {
@@ -1229,6 +1260,7 @@ void TimingAnalyser::build_slack_histogram_report()
 
                     delay_t delay = arr.second.value.maxDelay() - req.second.value.minDelay();
                     delay_t slack = clk_period - delay;
+                    slack += domain_pairs.at(domain_pair_id(arr.first, req.first)).multicycle_slack;
 
                     int slack_ps = ctx->getDelayNS(slack) * 1000;
                     slack_histogram[slack_ps]++;
@@ -1265,7 +1297,7 @@ std::vector<CriticalPath> TimingAnalyser::get_min_delay_violations()
                 auto clocks = std::make_pair(launch_clock, capture_clock);
                 auto related_clocks = clock_delays.count(clocks) > 0;
 
-                if (launch_id == async_clock_id || (launch_id != capture_id && !related_clocks)) {
+                if (launch_id == async_clock_id || (!launch.key.same_clock(capture.key) && !related_clocks)) {
                     continue;
                 }
 
@@ -1308,20 +1340,100 @@ std::vector<CriticalPath> TimingAnalyser::get_min_delay_violations()
     return sorted_violations;
 }
 
-domain_id_t TimingAnalyser::domain_id(IdString cell, IdString clock_port, ClockEdge edge)
+domain_id_t TimingAnalyser::domain_id(IdString cell, IdString clock_port, ClockEdge edge, int multicycle)
 {
-    return domain_id(ctx->cells.at(cell)->ports.at(clock_port).net, edge);
+    return domain_id(ctx->cells.at(cell)->ports.at(clock_port).net, edge, multicycle);
 }
 
-domain_id_t TimingAnalyser::domain_id(const NetInfo *net, ClockEdge edge)
+domain_id_t TimingAnalyser::domain_id(const NetInfo *net, ClockEdge edge, int multicycle)
 {
     NPNR_ASSERT(net != nullptr);
-    ClockDomainKey key{net->name, edge};
+    ClockDomainKey key{net->name, edge, multicycle};
     auto inserted = domain_to_id.emplace(key, domains.size());
     if (inserted.second) {
         domains.emplace_back(key);
     }
     return inserted.first->second;
+}
+
+// set_multicycle_path -from (sdc.cc, xilinx xdc.cc) makes group <g>: its startpoints carry NEXTPNR_MCP_FROM = g and,
+// with -to, its endpoints NEXTPNR_MCP_TO = g. The setting timing/multicycle/<g> holds N, and timing/multicycle/<g>/to
+// is set when the group has a -to list. Startpoints and endpoints of a group get their own clock domains.
+int TimingAnalyser::multicycle_group(IdString cell, bool endpoint) const
+{
+    auto found = ctx->cells.find(cell);
+    if (found == ctx->cells.end())
+        return 0;
+    IdString attr = ctx->id(endpoint ? "NEXTPNR_MCP_TO" : "NEXTPNR_MCP_FROM");
+    if (!found->second->attrs.count(attr))
+        return 0;
+    return int(int_attr(ctx, found->second.get(), attr));
+}
+
+int TimingAnalyser::multicycle_periods(const ClockDomainPairKey &pair, delay_t period) const
+{
+    const auto &launch = domains.at(pair.launch).key;
+    const auto &capture = domains.at(pair.capture).key;
+    int group = launch.multicycle;
+    bool launch_is_in_a_group = group != 0;
+    if (!launch_is_in_a_group)
+        return 1;
+    std::string setting = "timing/multicycle/" + std::to_string(group);
+    bool to_any_endpoint = !bool_or_default(ctx->settings, ctx->id(setting + "/to"), false);
+    bool capture_is_in_the_group = capture.multicycle == group;
+    if (!to_any_endpoint && !capture_is_in_the_group)
+        return 1;
+    return cap_multicycle(int_or_default(ctx->settings, ctx->id(setting), 1), period);
+}
+
+void set_multicycle_path(Context *ctx, int cycles, const std::vector<CellInfo *> *from,
+                         const std::vector<CellInfo *> *to, int lineno)
+{
+    NPNR_ASSERT(cycles >= 1 && (from != nullptr || to != nullptr));
+    IdString setup_id = ctx->id("NEXTPNR_MCP_SETUP"), to_id = ctx->id("NEXTPNR_MCP_TO");
+    // A cell can be in one -from and one -to list (the analysis gives it one launch and one capture domain); the
+    // first one it is in applies.
+    auto tag = [&](const std::vector<CellInfo *> &cells, const std::string &option, IdString attr, int value) {
+        bool is_to = option == "-to";
+        pool<IdString> tagged;
+        for (CellInfo *cell : cells) {
+            bool listed_twice_here = tagged.count(cell->name) > 0;
+            if (listed_twice_here)
+                continue;
+            bool in_another_list =
+                    is_to ? cell->attrs.count(setup_id) || cell->attrs.count(to_id) : cell->attrs.count(attr) > 0;
+            if (in_another_list) {
+                log_warning("cell '%s' is in the %s list of an earlier set_multicycle_path, which it keeps (line %d)\n",
+                            cell->name.c_str(ctx), option.c_str(), lineno);
+                continue;
+            }
+            cell->attrs[attr] = Property(value);
+            tagged.insert(cell->name);
+        }
+        if (tagged.empty())
+            log_warning("set_multicycle_path: the %s list matches no cells (line %d)\n", option.c_str(), lineno);
+        return int(tagged.size());
+    };
+    // Without -from, the endpoints carry N, as in walk_backward()
+    if (from == nullptr) {
+        int n_to = tag(*to, "-to", setup_id, cycles);
+        log_info("set_multicycle_path %d: to %d cells (line %d)\n", cycles, n_to, lineno);
+        return;
+    }
+    // With -from, a group (see TimingAnalyser::multicycle_group): the next free one, for more than one constraints file
+    int group = 1;
+    while (ctx->settings.count(ctx->id("timing/multicycle/" + std::to_string(group))))
+        group++;
+    std::string setting = "timing/multicycle/" + std::to_string(group);
+    ctx->settings[ctx->id(setting)] = Property(cycles);
+    int n_from = tag(*from, "-from", ctx->id("NEXTPNR_MCP_FROM"), group);
+    if (to == nullptr) {
+        log_info("set_multicycle_path %d: from %d cells (line %d)\n", cycles, n_from, lineno);
+        return;
+    }
+    ctx->settings[ctx->id(setting + "/to")] = Property(1);
+    int n_to = tag(*to, "-to", to_id, group);
+    log_info("set_multicycle_path %d: from %d to %d cells (line %d)\n", cycles, n_from, n_to, lineno);
 }
 
 domain_id_t TimingAnalyser::domain_pair_id(domain_id_t launch, domain_id_t capture)

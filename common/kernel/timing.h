@@ -49,13 +49,25 @@ struct ClockDomainKey
 {
     IdString clock;
     ClockEdge edge;
-    ClockDomainKey(IdString clock_net, ClockEdge edge) : clock(clock_net), edge(edge) {};
+    // set_multicycle_path -from group of the startpoints (launch) or endpoints (capture) in this domain; 0: none
+    int multicycle;
+    ClockDomainKey(IdString clock_net, ClockEdge edge, int multicycle = 0)
+            : clock(clock_net), edge(edge), multicycle(multicycle) {};
     // probably also need something here to deal with constraints
     inline bool is_async() const { return clock == IdString(); }
+    // the same clock and edge, whatever the multicycle group
+    inline bool same_clock(const ClockDomainKey &other) const { return (clock == other.clock) && (edge == other.edge); }
 
-    unsigned int hash() const { return mkhash(clock.hash(), int(edge)); }
+    unsigned int hash() const
+    {
+        unsigned int h = mkhash(clock.hash(), int(edge));
+        return multicycle ? mkhash(h, multicycle) : h;
+    }
 
-    inline bool operator==(const ClockDomainKey &other) const { return (clock == other.clock) && (edge == other.edge); }
+    inline bool operator==(const ClockDomainKey &other) const
+    {
+        return same_clock(other) && (multicycle == other.multicycle);
+    }
 };
 
 typedef int domain_id_t;
@@ -220,15 +232,25 @@ struct TimingAnalyser
         PerDomainPair(ClockDomainPairKey key) : key(key) {};
         ClockDomainPairKey key;
         DelayPair period{0};
+        // launch and capture on the same clock and edge, whatever their multicycle groups
+        bool same_clock = false;
+        // set_multicycle_path -from: the clock periods this pair has, and the setup slack the N-1 extra ones add
+        int multicycle = 1;
+        delay_t multicycle_slack = 0;
         delay_t worst_setup_slack, worst_hold_slack;
     };
 
     CellInfo *cell_info(const CellPortKey &key);
     PortInfo &port_info(const CellPortKey &key);
 
-    domain_id_t domain_id(IdString cell, IdString clock_port, ClockEdge edge);
-    domain_id_t domain_id(const NetInfo *net, ClockEdge edge);
+    domain_id_t domain_id(IdString cell, IdString clock_port, ClockEdge edge, int multicycle = 0);
+    domain_id_t domain_id(const NetInfo *net, ClockEdge edge, int multicycle = 0);
     domain_id_t domain_pair_id(domain_id_t launch, domain_id_t capture);
+
+    // set_multicycle_path -from: a cell's group as a startpoint or an endpoint; 0 if none
+    int multicycle_group(IdString cell, bool endpoint) const;
+    // the clock periods of a same-clock domain pair: N if it is in a set_multicycle_path -from group, else 1
+    int multicycle_periods(const ClockDomainPairKey &pair, delay_t period) const;
 
     void copy_domains(const CellPortKey &from, const CellPortKey &to, bool backwards);
 
@@ -253,6 +275,11 @@ struct TimingAnalyser
 // Perform timing analysis and optionaly print out slack histogram, fmax and critical paths
 void timing_analysis(Context *ctx, bool slack_histogram = true, bool print_fmax = true, bool print_path = false,
                      bool warn_on_failure = false, bool update_results = false);
+
+// For the constraint readers: set_multicycle_path -setup <cycles> from the from cells (any cell, if null) to the to
+// cells (any cell, if null). lineno is the constraint's line, for the log.
+void set_multicycle_path(Context *ctx, int cycles, const std::vector<CellInfo *> *from,
+                         const std::vector<CellInfo *> *to, int lineno);
 
 NEXTPNR_NAMESPACE_END
 
