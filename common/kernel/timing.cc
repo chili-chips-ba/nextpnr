@@ -22,6 +22,7 @@
 #include "timing.h"
 #include <algorithm>
 #include <boost/range/adaptor/reversed.hpp>
+#include <cerrno>
 #include <deque>
 #include <limits>
 #include <map>
@@ -627,7 +628,17 @@ static int setup_multicycle(const Context *ctx, IdString cell, IdString clock)
     if (mcp == attrs.end())
         return 1;
     const Property &n = mcp->second;
-    int64_t cycles = n.is_string ? std::strtoll(n.as_string().c_str(), nullptr, 10) : n.as_int64();
+    int64_t cycles = n.is_string ? 0 : n.as_int64();
+    if (n.is_string) {
+        // a decimal string, as the XDC reader sets it
+        const std::string &text = n.as_string();
+        char *end = nullptr;
+        errno = 0;
+        cycles = std::strtoll(text.c_str(), &end, 10);
+        bool is_integer = !text.empty() && *end == '\0' && errno == 0;
+        if (!is_integer)
+            log_error("cell '%s': NEXTPNR_MCP_SETUP = \"%s\" is not an integer\n", cell.c_str(ctx), text.c_str());
+    }
     cycles = std::max<int64_t>(1, cycles);
     // Keep (N-1) periods well inside delay_t; a larger N leaves no setup check anyway.
     delay_t period = ctx->nets.at(clock)->clkconstr->period.minDelay();
