@@ -39,8 +39,8 @@ NEXTPNR_NAMESPACE_BEGIN
 // analysis sees these cells, and the macro is removed.
 static void copy_multicycle_tags(const Context *ctx, const CellInfo *macro, CellInfo *dram_lut)
 {
-    for (auto &attr : macro->attrs) {
-        bool is_multicycle_tag = attr.first.str(ctx).rfind("NEXTPNR_MCP_", 0) == 0;
+    for (const auto &attr : macro->attrs) {
+        const bool is_multicycle_tag = attr.first.str(ctx).rfind("NEXTPNR_MCP_", 0) == 0;
         if (is_multicycle_tag)
             dram_lut->attrs[attr.first] = attr.second;
     }
@@ -267,6 +267,7 @@ void XilinxPacker::pack_dram()
         if (cs.memtype == id_RAM64X1D) {
             int z = height - 1;
             CellInfo *base = nullptr;
+            const CellInfo *base_macro = nullptr;
             for (auto cell : group.second) {
                 NPNR_ASSERT(cell->type == id_RAM64X1D); // FIXME
 
@@ -282,6 +283,7 @@ void XilinxPacker::pack_dram()
                     std::vector<NetInfo *> address(cs.wa.begin(), cs.wa.begin() + std::min<size_t>(cs.wa.size(), 6));
                     base = create_dram_lut(cell->name.str(ctx) + "/ADDR", nullptr, cs, address, nullptr, nullptr, z,
                                            cell);
+                    base_macro = cell;
                     z--;
                 }
 
@@ -292,7 +294,10 @@ void XilinxPacker::pack_dram()
 
                 NetInfo *di = cell->getPort(id_D);
                 if (spo != nullptr) {
-                    if (z == (height - 2)) {
+                    // Only the macro that made the base folds its SPO into it: the base carries that macro's
+                    // set_multicycle_path tags, and its O6 takes one net.
+                    const bool can_fold = z == (height - 2) && base_macro == cell;
+                    if (can_fold) {
                         // Can fold DPO into address buffer
                         base->connectPort(id_O6, spo);
                         base->connectPort(id_DI1, di);
@@ -362,6 +367,7 @@ void XilinxPacker::pack_dram()
         } else if (cs.memtype == id_RAM32X1D) {
             int z = (height - 1);
             CellInfo *base = nullptr;
+            const CellInfo *base_macro = nullptr;
             for (auto cell : group.second) {
                 NPNR_ASSERT(cell->type == id_RAM32X1D);
 
@@ -378,6 +384,7 @@ void XilinxPacker::pack_dram()
                     address.push_back(ctx->nets[ctx->id("$PACKER_GND_NET")].get());
                     base = create_dram_lut(cell->name.str(ctx) + "/ADDR", nullptr, cs, address, nullptr, nullptr, z,
                                            cell);
+                    base_macro = cell;
                     z--;
                 }
 
@@ -388,7 +395,10 @@ void XilinxPacker::pack_dram()
 
                 NetInfo *di = cell->getPort(id_D);
                 if (spo != nullptr) {
-                    if (z == (height - 2)) {
+                    // Only the macro that made the base folds its SPO into it: the base carries that macro's
+                    // set_multicycle_path tags, and its O6 takes one net.
+                    const bool can_fold = z == (height - 2) && base_macro == cell;
+                    if (can_fold) {
                         // Can fold DPO into address buffer
                         base->connectPort(id_O6, spo);
                         base->connectPort(id_DI1, di);
