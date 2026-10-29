@@ -334,9 +334,9 @@ void XilinxImpl::parse_xdc(const std::string &filename)
             }
         } else if (cmd == "set_multicycle_path") {
             // set_multicycle_path [-setup|-hold] [-end] <N> -to <sel>: the -to cells carry N (NEXTPNR_MCP_SETUP)
-            // for the timing analysis. <sel> is a list of cell names, or [get_cells|get_pins|get_nets ...] with
-            // names or -filter {NAME =~ <glob>}. A pin stands for its cell, a net for the cell that drives it (a
-            // register inferred by synthesis keeps its RTL name on its output net only).
+            // for the timing analysis. <sel> is a list of cell names, or [get_cells ...] with names or
+            // -filter {NAME =~ <glob>}. get_pins and get_nets are not taken: the tag relaxes every input of a
+            // cell, and Vivado does not apply a net in -to.
             //  (Port of nextpnr-xilinx 813bb715.)
             auto glob_match = [](const std::string &name, const std::string &pat) {
                 // simple '*' wildcard match
@@ -362,48 +362,21 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                     ++p;
                 return p == pat.size();
             };
-            // The cells a name or glob selects, as get_cells, get_pins or get_nets
-            auto add_matches = [&](const std::string &kind, const std::string &pattern,
-                                   std::vector<CellInfo *> &cells) {
-                bool is_glob = pattern.find_first_of("*?") != std::string::npos;
-                if (kind == "get_nets") {
-                    // A net matches by any of its names: net_aliases maps each one, its own too, to the net
-                    pool<IdString> nets;
-                    if (!is_glob) {
-                        auto alias = ctx->net_aliases.find(ctx->id(pattern));
-                        if (alias != ctx->net_aliases.end())
-                            nets.insert(alias->second);
-                    } else {
-                        for (auto &alias : ctx->net_aliases)
-                            if (glob_match(alias.first.str(ctx), pattern))
-                                nets.insert(alias.second);
-                    }
-                    for (IdString name : nets) {
-                        auto net = ctx->nets.find(name);
-                        CellInfo *driver = net == ctx->nets.end() ? nullptr : net->second->driver.cell;
-                        // the JSON frontend's constant drivers are not paths
-                        bool is_path_start = driver != nullptr && !driver->type.in(id_GND, id_VCC);
-                        if (is_path_start)
-                            cells.push_back(driver);
-                    }
-                    return;
-                }
-                // get_pins: <cell>/<pin>, and the pin's cell is meant
-                std::string cell_pattern = pattern;
-                if (kind == "get_pins")
-                    cell_pattern = pattern.substr(0, pattern.rfind('/'));
+            // The cells a name or glob selects
+            auto add_matches = [&](const std::string &pattern, std::vector<CellInfo *> &cells) {
+                const bool is_glob = pattern.find_first_of("*?") != std::string::npos;
                 if (!is_glob) {
-                    IdString name = ctx->id(cell_pattern);
-                    if (!ctx->cells.count(name) && !debus_zero(cell_pattern).empty())
-                        name = ctx->id(debus_zero(cell_pattern));
+                    IdString name = ctx->id(pattern);
+                    if (!ctx->cells.count(name) && !debus_zero(pattern).empty())
+                        name = ctx->id(debus_zero(pattern));
                     if (ctx->cells.count(name))
                         cells.push_back(ctx->cells.at(name).get());
                     return;
                 }
                 for (auto &cell : ctx->cells) {
                     // the JSON frontend's constant drivers, e.g. "g[0].q.CE$const$VCC$12", are not paths
-                    bool is_constant_driver = cell.second->type.in(id_GND, id_VCC);
-                    if (!is_constant_driver && glob_match(cell.first.str(ctx), cell_pattern))
+                    const bool is_constant_driver = cell.second->type.in(id_GND, id_VCC);
+                    if (!is_constant_driver && glob_match(cell.first.str(ctx), pattern))
                         cells.push_back(cell.second.get());
                 }
             };
@@ -420,7 +393,7 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                         depth++;
                     else if (c == '}' && !quoted)
                         depth--;
-                    bool separates_words = std::isspace(c) && depth == 0 && !quoted;
+                    const bool separates_words = std::isspace(c) && depth == 0 && !quoted;
                     if (!separates_words)
                         word += c;
                     else if (!word.empty()) {
@@ -434,14 +407,14 @@ void XilinxImpl::parse_xdc(const std::string &filename)
             };
             // The cells of a -to selector; false, with a warning, for a form this reader does not take
             auto select_cells = [&](const std::string &sel, std::vector<CellInfo *> &cells) {
-                bool is_command = sel.size() >= 2 && sel.front() == '[' && sel.back() == ']';
+                const bool is_command = sel.size() >= 2 && sel.front() == '[' && sel.back() == ']';
                 std::vector<std::string> words =
                         tcl_words(is_command ? sel.substr(1, sel.size() - 2) : strip_quotes(sel));
                 std::string kind = "get_cells";
                 int cursor = 0;
                 if (is_command) {
                     kind = words.empty() ? std::string() : words.front();
-                    bool is_supported_command = kind == "get_cells" || kind == "get_pins" || kind == "get_nets";
+                    const bool is_supported_command = kind == "get_cells";
                     if (!is_supported_command) {
                         log_warning("ignoring set_multicycle_path with unsupported selector '%s' (on line %d)\n",
                                     sel.c_str(), lineno);
@@ -454,33 +427,33 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                 bool has_names = false, has_filter = false;
                 for (; cursor < int(words.size()); cursor++) {
                     const std::string &w = words.at(cursor);
-                    bool names_are_flat = w == "-hier" || w == "-hierarchical" || w == "-quiet";
+                    const bool names_are_flat = w == "-hier" || w == "-hierarchical" || w == "-quiet";
                     if (names_are_flat)
                         continue;
-                    bool is_filter = w == "-filter" && cursor + 1 < int(words.size());
+                    const bool is_filter = w == "-filter" && cursor + 1 < int(words.size());
                     if (is_filter) {
                         // only NAME =~ <glob> and NAME == <name>
                         std::vector<std::string> expr = tcl_words(strip_quotes(words.at(++cursor)));
-                        bool is_name_filter =
+                        const bool is_name_filter =
                                 expr.size() == 3 && expr.at(0) == "NAME" && (expr.at(1) == "=~" || expr.at(1) == "==");
                         if (!is_name_filter) {
                             log_warning("ignoring set_multicycle_path with unsupported -filter '%s', only "
-                                        "NAME =~ <glob> (on line %d)\n",
+                                        "NAME =~ <glob> or NAME == <name> (on line %d)\n",
                                         words.at(cursor).c_str(), lineno);
                             return false;
                         }
-                        add_matches(kind, strip_quotes(expr.at(2)), filtered);
+                        add_matches(strip_quotes(expr.at(2)), filtered);
                         has_filter = true;
                         continue;
                     }
-                    bool is_other_option = w.front() == '-';
+                    const bool is_other_option = w.front() == '-';
                     if (is_other_option) {
                         log_warning("ignoring set_multicycle_path with unsupported %s option '%s' (on line %d)\n",
                                     kind.c_str(), w.c_str(), lineno);
                         return false;
                     }
                     for (const std::string &name : tcl_words(strip_quotes(w)))
-                        add_matches(kind, name, named);
+                        add_matches(name, named);
                     has_names = true;
                 }
                 if (has_names && has_filter) {
@@ -501,10 +474,14 @@ void XilinxImpl::parse_xdc(const std::string &filename)
             std::string to_sel;
             for (int c = 1; c < int(arguments.size()); c++) {
                 const std::string &a = arguments.at(c);
-                bool has_value = c + 1 < int(arguments.size());
-                bool is_cycle_count = !a.empty() && std::all_of(a.begin(), a.end(), ::isdigit);
-                // one clock: -start and -end move the same capture edge
-                bool has_no_effect_here = a == "-setup" || a == "-end" || a == "-start";
+                const bool has_value = c + 1 < int(arguments.size());
+                // an N that does not fit an int is not taken (Vivado refuses 2^32 and more)
+                const bool is_cycle_count = !a.empty() && a.size() <= 10 &&
+                                            std::all_of(a.begin(), a.end(), ::isdigit) &&
+                                            std::strtoll(a.c_str(), nullptr, 10) <= std::numeric_limits<int>::max();
+                // -end: the capture edge moves N-1 capture periods. -start counts launch periods, which the
+                // timing hook does not know, so it is left to the unsupported-argument warning below.
+                const bool has_no_effect_here = a == "-setup" || a == "-end";
                 if (has_no_effect_here)
                     continue;
                 if (a == "-hold")
@@ -515,9 +492,7 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                 } else if (a == "-to" && has_value)
                     to_sel = arguments.at(++c);
                 else if (is_cycle_count)
-                    // the timing analysis caps N anyway
-                    cycles = int(
-                            std::min<long long>(std::strtoll(a.c_str(), nullptr, 10), std::numeric_limits<int>::max()));
+                    cycles = std::stoi(a);
                 else {
                     log_warning("ignoring set_multicycle_path with unsupported argument '%s' (on line %d)\n", a.c_str(),
                                 lineno);
@@ -528,7 +503,7 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                 log_info("set_multicycle_path -hold: hold stays checked on the launch edge (on line %d)\n", lineno);
                 goto nextline;
             }
-            bool is_incomplete = cycles < 1 || to_sel.empty();
+            const bool is_incomplete = cycles < 1 || to_sel.empty();
             if (is_incomplete) {
                 log_warning("ignoring set_multicycle_path without N of 1 or more, or without -to (on line %d)\n",
                             lineno);
