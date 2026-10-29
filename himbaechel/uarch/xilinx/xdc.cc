@@ -19,6 +19,7 @@
 
 #include <boost/algorithm/string.hpp>
 #include <fstream>
+#include <limits>
 #include <regex>
 
 #include "extra_data.h"
@@ -332,11 +333,10 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                 n->clkconstr->low = DelayPair(ctx->getDelayFromNS(period / 2));
             }
         } else if (cmd == "set_multicycle_path") {
-            // set_multicycle_path <N> [-setup|-hold] -from [<sel>] -to [<sel>]
-            // Tags the destination (capture) cells with a multicycle factor so
-            // the timing engine can relax the setup requirement on those
-            // endpoints.  Supports a NAME glob in the -to selector, e.g.
-            // -to [get_cells -hier -filter {NAME =~ *rf_reg*}].
+            // set_multicycle_path [-setup|-hold] [-end] <N> -to <sel>: the -to cells carry N (NEXTPNR_MCP_SETUP)
+            // for the timing analysis. <sel> is a list of cell names, or [get_cells|get_pins|get_nets ...] with
+            // names or -filter {NAME =~ <glob>}. A pin stands for its cell, a net for the cell that drives it (a
+            // register inferred by synthesis keeps its RTL name on its output net only).
             //  (Port of nextpnr-xilinx 813bb715.)
             auto glob_match = [](const std::string &name, const std::string &pat) {
                 // simple '*' wildcard match
@@ -362,54 +362,174 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                     ++p;
                 return p == pat.size();
             };
-            int mcp = 1;
+            // The cells a name or glob selects, as get_cells, get_pins or get_nets
+            auto add_matches = [&](const std::string &kind, const std::string &pattern,
+                                   std::vector<CellInfo *> &cells) {
+                bool is_glob = pattern.find_first_of("*?") != std::string::npos;
+                if (kind == "get_nets") {
+                    // A net matches by any of its names: net_aliases maps each one, its own too, to the net
+                    pool<IdString> nets;
+                    if (!is_glob) {
+                        auto alias = ctx->net_aliases.find(ctx->id(pattern));
+                        if (alias != ctx->net_aliases.end())
+                            nets.insert(alias->second);
+                    } else {
+                        for (auto &alias : ctx->net_aliases)
+                            if (glob_match(alias.first.str(ctx), pattern))
+                                nets.insert(alias.second);
+                    }
+                    for (IdString name : nets) {
+                        auto net = ctx->nets.find(name);
+                        CellInfo *driver = net == ctx->nets.end() ? nullptr : net->second->driver.cell;
+                        // the JSON frontend's constant drivers are not paths
+                        bool is_path_start = driver != nullptr && !driver->type.in(id_GND, id_VCC);
+                        if (is_path_start)
+                            cells.push_back(driver);
+                    }
+                    return;
+                }
+                // get_pins: <cell>/<pin>, and the pin's cell is meant
+                std::string cell_pattern = pattern;
+                if (kind == "get_pins")
+                    cell_pattern = pattern.substr(0, pattern.rfind('/'));
+                if (!is_glob) {
+                    IdString name = ctx->id(cell_pattern);
+                    if (!ctx->cells.count(name) && !debus_zero(cell_pattern).empty())
+                        name = ctx->id(debus_zero(cell_pattern));
+                    if (ctx->cells.count(name))
+                        cells.push_back(ctx->cells.at(name).get());
+                    return;
+                }
+                for (auto &cell : ctx->cells) {
+                    // the JSON frontend's constant drivers, e.g. "g[0].q.CE$const$VCC$12", are not paths
+                    bool is_constant_driver = cell.second->type.in(id_GND, id_VCC);
+                    if (!is_constant_driver && glob_match(cell.first.str(ctx), cell_pattern))
+                        cells.push_back(cell.second.get());
+                }
+            };
+            // Tcl words: {...} and "..." group, and brackets stay in a name such as g[3].q
+            auto tcl_words = [](const std::string &str) {
+                std::vector<std::string> words;
+                std::string word;
+                int depth = 0;
+                bool quoted = false;
+                for (char c : str) {
+                    if (c == '"' && depth == 0)
+                        quoted = !quoted;
+                    else if (c == '{' && !quoted)
+                        depth++;
+                    else if (c == '}' && !quoted)
+                        depth--;
+                    bool separates_words = std::isspace(c) && depth == 0 && !quoted;
+                    if (!separates_words)
+                        word += c;
+                    else if (!word.empty()) {
+                        words.push_back(word);
+                        word.clear();
+                    }
+                }
+                if (!word.empty())
+                    words.push_back(word);
+                return words;
+            };
+            // The cells of a -to selector; false, with a warning, for a form this reader does not take
+            auto select_cells = [&](const std::string &sel, std::vector<CellInfo *> &cells) {
+                bool is_command = sel.size() >= 2 && sel.front() == '[' && sel.back() == ']';
+                std::vector<std::string> words =
+                        tcl_words(is_command ? sel.substr(1, sel.size() - 2) : strip_quotes(sel));
+                std::string kind = "get_cells";
+                int cursor = 0;
+                if (is_command) {
+                    kind = words.empty() ? std::string() : words.front();
+                    bool is_supported_command = kind == "get_cells" || kind == "get_pins" || kind == "get_nets";
+                    if (!is_supported_command) {
+                        log_warning("ignoring set_multicycle_path with unsupported selector '%s' (on line %d)\n",
+                                    sel.c_str(), lineno);
+                        return false;
+                    }
+                    cursor = 1;
+                }
+                for (; cursor < int(words.size()); cursor++) {
+                    const std::string &w = words.at(cursor);
+                    bool names_are_flat = w == "-hier" || w == "-hierarchical" || w == "-quiet";
+                    if (names_are_flat)
+                        continue;
+                    bool is_filter = w == "-filter" && cursor + 1 < int(words.size());
+                    if (is_filter) {
+                        // only NAME =~ <glob> and NAME == <name>
+                        std::vector<std::string> expr = tcl_words(strip_quotes(words.at(++cursor)));
+                        bool is_name_filter =
+                                expr.size() == 3 && expr.at(0) == "NAME" && (expr.at(1) == "=~" || expr.at(1) == "==");
+                        if (!is_name_filter) {
+                            log_warning("ignoring set_multicycle_path with unsupported -filter '%s', only "
+                                        "NAME =~ <glob> (on line %d)\n",
+                                        words.at(cursor).c_str(), lineno);
+                            return false;
+                        }
+                        add_matches(kind, strip_quotes(expr.at(2)), cells);
+                        continue;
+                    }
+                    bool is_other_option = w.front() == '-';
+                    if (is_other_option) {
+                        log_warning("ignoring set_multicycle_path with unsupported %s option '%s' (on line %d)\n",
+                                    kind.c_str(), w.c_str(), lineno);
+                        return false;
+                    }
+                    for (const std::string &name : tcl_words(strip_quotes(w)))
+                        add_matches(kind, name, cells);
+                }
+                return true;
+            };
+            int cycles = 0;
             bool is_hold = false;
             std::string to_sel;
             for (int c = 1; c < int(arguments.size()); c++) {
                 const std::string &a = arguments.at(c);
-                bool to_option_with_value = a == "-to" && c + 1 < int(arguments.size());
+                bool has_value = c + 1 < int(arguments.size());
                 bool is_cycle_count = !a.empty() && std::all_of(a.begin(), a.end(), ::isdigit);
+                // one clock: -start and -end move the same capture edge
+                bool has_no_effect_here = a == "-setup" || a == "-end" || a == "-start";
+                if (has_no_effect_here)
+                    continue;
                 if (a == "-hold")
                     is_hold = true;
-                else if (to_option_with_value)
-                    to_sel = arguments.at(++c);
                 else if (a == "-from") {
                     log_warning("ignoring unsupported XDC option '-from' in set_multicycle_path (on line %d)\n", lineno);
                     goto nextline;
-                }
+                } else if (a == "-to" && has_value)
+                    to_sel = arguments.at(++c);
                 else if (is_cycle_count)
-                    mcp = std::stoi(a);
-            }
-            // extract the NAME glob from the -to selector (substring after "=~")
-            std::string to_pat;
-            size_t eq = to_sel.find("=~");
-            if (eq != std::string::npos)
-                to_pat = to_sel.substr(eq + 2);
-            auto clean = [](std::string s) {
-                std::string o;
-                for (char ch : s) {
-                    bool is_tcl_punctuation = ch == '{' || ch == '}' || ch == ']' || ch == '[' || std::isspace(ch);
-                    if (!is_tcl_punctuation)
-                        o += ch;
+                    // the timing analysis caps N anyway
+                    cycles = int(
+                            std::min<long long>(std::strtoll(a.c_str(), nullptr, 10), std::numeric_limits<int>::max()));
+                else {
+                    log_warning("ignoring set_multicycle_path with unsupported argument '%s' (on line %d)\n", a.c_str(),
+                                lineno);
+                    goto nextline;
                 }
-                return o;
-            };
-            to_pat = clean(to_pat);
-            bool tags_setup_endpoints = !is_hold && !to_pat.empty();
-            if (tags_setup_endpoints) {
-                int tagged = 0;
-                for (auto &kv : ctx->cells) {
-                    std::string cn = kv.first.str(ctx);
-                    if (glob_match(cn, to_pat)) {
-                        kv.second->attrs[id_NEXTPNR_MCP_SETUP] = std::to_string(mcp);
-                        ++tagged;
-                    }
-                }
-                log_info("set_multicycle_path: setup multicycle %d tagged on %d cells matching '%s' (on line %d)\n",
-                         mcp, tagged, to_pat.c_str(), lineno);
-            } else {
-                log_info("set_multicycle_path: parsed (hold or no -to glob) - no setup tag (on line %d)\n", lineno);
             }
+            if (is_hold) {
+                log_info("set_multicycle_path -hold: hold stays checked on the launch edge (on line %d)\n", lineno);
+                goto nextline;
+            }
+            bool is_incomplete = cycles < 1 || to_sel.empty();
+            if (is_incomplete) {
+                log_warning("ignoring set_multicycle_path without N of 1 or more, or without -to (on line %d)\n",
+                            lineno);
+                goto nextline;
+            }
+            std::vector<CellInfo *> to_cells;
+            if (!select_cells(to_sel, to_cells))
+                goto nextline;
+            pool<IdString> tagged;
+            for (CellInfo *cell : to_cells)
+                if (tagged.insert(cell->name).second)
+                    cell->attrs[id_NEXTPNR_MCP_SETUP] = std::to_string(cycles);
+            if (tagged.empty())
+                log_warning("set_multicycle_path: the -to list matches no cells (on line %d)\n", lineno);
+            else
+                log_info("set_multicycle_path: setup multicycle %d tagged on %d cells (on line %d)\n", cycles,
+                         int(tagged.size()), lineno);
         } else {
             log_warning("ignoring unsupported XDC command '%s' (on line %d)\n", cmd.c_str(), lineno);
         }
