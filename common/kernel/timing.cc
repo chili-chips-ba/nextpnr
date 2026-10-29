@@ -619,9 +619,7 @@ void TimingAnalyser::walk_forward()
 // tagged or the capture clock has no period constraint.
 static int setup_multicycle(const Context *ctx, IdString cell, IdString clock)
 {
-    if (cell == IdString() || clock == IdString() || !ctx->cells.count(cell) || !ctx->nets.count(clock))
-        return 1;
-    if (!ctx->nets.at(clock)->clkconstr)
+    if (cell == IdString() || !ctx->cells.count(cell))
         return 1;
     const auto &attrs = ctx->cells.at(cell)->attrs;
     auto mcp = attrs.find(ctx->id("NEXTPNR_MCP_SETUP"));
@@ -639,6 +637,9 @@ static int setup_multicycle(const Context *ctx, IdString cell, IdString clock)
         if (!is_integer)
             log_error("cell '%s': NEXTPNR_MCP_SETUP = \"%s\" is not an integer\n", cell.c_str(ctx), text.c_str());
     }
+    // checked above even when the clock has no period constraint
+    if (clock == IdString() || !ctx->nets.count(clock) || !ctx->nets.at(clock)->clkconstr)
+        return 1;
     cycles = std::max<int64_t>(1, cycles);
     // Keep (N-1) periods well inside delay_t; a larger N leaves no setup check anyway.
     delay_t period = ctx->nets.at(clock)->clkconstr->period.minDelay();
