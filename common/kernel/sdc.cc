@@ -313,10 +313,14 @@ struct SDCParser
                 if (s.at(0) == '-')
                     log_error("unsupported argument '%s' to get_nets (line %d)\n", s.c_str(), lineno);
                 if (is_glob(s)) {
+                    // A net matches by any of its names: net_aliases maps each one, its own too, to the net
                     size_t found = nets.size();
-                    for (auto &net : ctx->nets)
-                        if (glob_match(net.first.str(ctx), s))
-                            nets.emplace_back(SdcEntity::ENTITY_NET, net.first);
+                    pool<IdString> matched;
+                    for (auto &alias : ctx->net_aliases) {
+                        bool selected = ctx->nets.count(alias.second) && glob_match(alias.first.str(ctx), s);
+                        if (selected && matched.insert(alias.second).second)
+                            nets.emplace_back(SdcEntity::ENTITY_NET, alias.second);
+                    }
                     if (nets.size() == found)
                         log_warning("get_nets argument '%s' matched no objects.\n", s.c_str());
                     continue;

@@ -368,11 +368,16 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                                    std::vector<CellInfo *> &cells) {
                 bool is_glob = pattern.find_first_of("*?") != std::string::npos;
                 if (kind == "get_nets") {
-                    for (auto &net : ctx->nets) {
+                    // A net matches by any of its names: net_aliases maps each one, its own too, to the net
+                    pool<IdString> matched;
+                    for (auto &alias : ctx->net_aliases) {
                         bool selected =
-                                is_glob ? glob_match(net.first.str(ctx), pattern) : net.first == ctx->id(pattern);
-                        if (selected && net.second->driver.cell != nullptr)
-                            cells.push_back(net.second->driver.cell);
+                                is_glob ? glob_match(alias.first.str(ctx), pattern) : alias.first == ctx->id(pattern);
+                        bool first_match =
+                                selected && ctx->nets.count(alias.second) && matched.insert(alias.second).second;
+                        CellInfo *driver = first_match ? ctx->nets.at(alias.second)->driver.cell : nullptr;
+                        if (driver != nullptr)
+                            cells.push_back(driver);
                     }
                     return;
                 }
