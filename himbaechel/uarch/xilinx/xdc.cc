@@ -449,6 +449,9 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                     }
                     cursor = 1;
                 }
+                // -filter narrows the named objects, as in Vivado; without names it selects from all of them
+                std::vector<CellInfo *> named, filtered;
+                bool has_names = false, has_filter = false;
                 for (; cursor < int(words.size()); cursor++) {
                     const std::string &w = words.at(cursor);
                     bool names_are_flat = w == "-hier" || w == "-hierarchical" || w == "-quiet";
@@ -466,7 +469,8 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                                         words.at(cursor).c_str(), lineno);
                             return false;
                         }
-                        add_matches(kind, strip_quotes(expr.at(2)), cells);
+                        add_matches(kind, strip_quotes(expr.at(2)), filtered);
+                        has_filter = true;
                         continue;
                     }
                     bool is_other_option = w.front() == '-';
@@ -476,7 +480,19 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                         return false;
                     }
                     for (const std::string &name : tcl_words(strip_quotes(w)))
-                        add_matches(kind, name, cells);
+                        add_matches(kind, name, named);
+                    has_names = true;
+                }
+                if (has_names && has_filter) {
+                    pool<IdString> passes_filter;
+                    for (CellInfo *cell : filtered)
+                        passes_filter.insert(cell->name);
+                    for (CellInfo *cell : named)
+                        if (passes_filter.count(cell->name))
+                            cells.push_back(cell);
+                } else {
+                    cells.insert(cells.end(), named.begin(), named.end());
+                    cells.insert(cells.end(), filtered.begin(), filtered.end());
                 }
                 return true;
             };
