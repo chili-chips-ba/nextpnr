@@ -335,8 +335,8 @@ void XilinxImpl::parse_xdc(const std::string &filename)
         } else if (cmd == "set_multicycle_path") {
             // set_multicycle_path [-setup|-hold] [-end] <N> -to <sel>: the -to cells carry N (NEXTPNR_MCP_SETUP)
             // for the timing analysis. <sel> is a list of cell names, or [get_cells ...] with names or
-            // -filter {NAME =~ <glob>}. get_pins and get_nets are not taken: the tag relaxes every input of a
-            // cell, and Vivado does not apply a net in -to.
+            // -filter {NAME =~ <glob>} or {NAME == <name>}. get_pins and get_nets are not taken: the tag relaxes
+            // every input of a cell, and Vivado does not apply a net in -to.
             //  (Port of nextpnr-xilinx 813bb715.)
             auto glob_match = [](const std::string &name, const std::string &pat) {
                 // simple '*' wildcard match
@@ -362,9 +362,9 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                     ++p;
                 return p == pat.size();
             };
-            // The cells a name or glob selects
-            auto add_matches = [&](const std::string &pattern, std::vector<CellInfo *> &cells) {
-                const bool is_glob = pattern.find_first_of("*?") != std::string::npos;
+            // The cells a name or glob selects; an exact name (NAME ==) is never a glob
+            auto add_matches = [&](const std::string &pattern, const bool is_exact, std::vector<CellInfo *> &cells) {
+                const bool is_glob = !is_exact && pattern.find_first_of("*?") != std::string::npos;
                 if (!is_glob) {
                     IdString name = ctx->id(pattern);
                     if (!ctx->cells.count(name) && !debus_zero(pattern).empty())
@@ -442,7 +442,9 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                                         words.at(cursor).c_str(), lineno);
                             return false;
                         }
-                        add_matches(strip_quotes(expr.at(2)), filtered);
+                        // NAME == compares the whole name, as in Vivado: a '*' there is not a wildcard
+                        const bool is_exact = expr.at(1) == "==";
+                        add_matches(strip_quotes(expr.at(2)), is_exact, filtered);
                         has_filter = true;
                         continue;
                     }
@@ -453,7 +455,7 @@ void XilinxImpl::parse_xdc(const std::string &filename)
                         return false;
                     }
                     for (const std::string &name : tcl_words(strip_quotes(w)))
-                        add_matches(name, named);
+                        add_matches(name, false, named);
                     has_names = true;
                 }
                 if (has_names && has_filter) {
